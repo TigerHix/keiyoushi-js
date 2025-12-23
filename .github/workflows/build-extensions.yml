@@ -185,7 +185,11 @@ jobs:
           }
           EOF
       
-      - name: Build extensions (chunk ${{ matrix.chunk }})
+      - name: Build and test extensions (chunk ${{ matrix.chunk }})
+        env:
+          TACHIYOMI_OUTPUT: ${{ github.workspace }}/dist/extensions
+          EXTENSIONS_SOURCE: ${{ github.workspace }}/extensions-source
+          SKIP_TESTS: ${{ inputs.skip_tests }}
         run: |
           EXTENSIONS="${{ needs.detect.outputs.extensions }}"
           IFS=',' read -ra EXT_ARRAY <<< "$EXTENSIONS"
@@ -203,10 +207,11 @@ jobs:
             exit 0
           fi
           
-          mkdir -p dist/extensions
-          RESULTS_FILE="chunk-${{ matrix.chunk }}-results.json"
-          echo '{"chunk": ${{ matrix.chunk }}, "extensions": [' > "$RESULTS_FILE"
-          FIRST=true
+          mkdir -p dist/extensions test-results
+          
+          # Track built extensions for result collection
+          declare -a BUILT_EXTS
+          declare -A BUILD_RESULTS  # associative array: EXT -> JSON
           
           for i in $(seq $START $(( END - 1 ))); do
             if [ $i -ge $TOTAL ]; then break; fi
@@ -222,7 +227,20 @@ jobs:
                 -PextensionsRoot="${{ github.workspace }}/extensions-source" \
                 -PoutputDir="${{ github.workspace }}/dist/extensions" \
                 --build-cache --parallel --configuration-cache > "$BUILD_OUTPUT" 2>&1; then
-              echo "✅ $EXT"
+              echo "✅ Built $EXT"
+              
+              # Post-process manifest for this extension
+              bun scripts/postprocess-manifests.ts "$EXT" 2>/dev/null || true
+              
+              # Start test in background (unless skipped)
+              if [ "$SKIP_TESTS" != "true" ]; then
+                EXT_SAFE="${EXT//\//-}"
+                (
+                  TEST_OUT=$(timeout 60 ./tachiyomi-js/cli/bin.ts test all "$EXT" --json 2>&1 || true)
+                  echo "$TEST_OUT" > "test-results/${EXT_SAFE}.json"
+                ) &
+                echo "  🧪 Test started in background"
+              fi
             else
               BUILD_STATUS="failed"
               echo "❌ $EXT"
@@ -232,58 +250,47 @@ jobs:
             BUILD_TIME=$(($(date +%s%3N) - BUILD_START))
             echo "::endgroup::"
             
-            [ "$FIRST" = true ] && FIRST=false || echo ',' >> "$RESULTS_FILE"
+            # Store build result
             BUILD_ERROR=$([ "$BUILD_STATUS" = "failed" ] && cat "$BUILD_OUTPUT" | tail -100 | jq -Rs '.' || echo 'null')
+            BUILD_RESULTS["$EXT"]="{\"id\": \"$EXT\", \"status\": \"$BUILD_STATUS\", \"buildTimeMs\": $BUILD_TIME, \"error\": $BUILD_ERROR}"
+            BUILT_EXTS+=("$EXT")
             
-            cat >> "$RESULTS_FILE" << EOF
-          {"id": "$EXT", "status": "$BUILD_STATUS", "buildTimeMs": $BUILD_TIME, "error": $BUILD_ERROR}
-          EOF
             rm -f "$BUILD_OUTPUT"
           done
           
-          echo ']}' >> "$RESULTS_FILE"
-      
-      - name: Post-process manifests
-        env:
-          TACHIYOMI_OUTPUT: ${{ github.workspace }}/dist/extensions
-          EXTENSIONS_SOURCE: ${{ github.workspace }}/extensions-source
-        run: bun scripts/postprocess-manifests.ts --all
-      
-      - name: Run tests
-        if: ${{ inputs.skip_tests != true }}
-        continue-on-error: true
-        env:
-          TACHIYOMI_OUTPUT: ${{ github.workspace }}/dist/extensions
-        run: |
+          # Wait for all background tests to complete
+          echo "Waiting for tests to complete..."
+          wait
+          echo "All tests completed"
+          
+          # Build final results JSON with test results merged
           RESULTS_FILE="chunk-${{ matrix.chunk }}-results.json"
-          RESULTS=$(cat "$RESULTS_FILE")
-          UPDATED=$(echo "$RESULTS" | jq '.extensions = []')
+          echo '{"chunk": ${{ matrix.chunk }}, "extensions": [' > "$RESULTS_FILE"
+          FIRST=true
           
-          for EXT in $(echo "$RESULTS" | jq -r '.extensions[] | select(.status == "success") | .id'); do
-            echo "Testing $EXT..."
+          for EXT in "${BUILT_EXTS[@]}"; do
+            [ "$FIRST" = true ] && FIRST=false || echo ',' >> "$RESULTS_FILE"
             
-            TEST_OUT=$(timeout 60 ./tachiyomi-js/cli/bin.ts test all "$EXT" --json 2>&1 || true)
+            BUILD_JSON="${BUILD_RESULTS[$EXT]}"
+            EXT_SAFE="${EXT//\//-}"
+            TEST_FILE="test-results/${EXT_SAFE}.json"
             
-            if echo "$TEST_OUT" | jq -e '.results' >/dev/null 2>&1; then
-              TEST_RESULT="$TEST_OUT"
+            if [ -f "$TEST_FILE" ]; then
+              TEST_OUT=$(cat "$TEST_FILE")
+              if echo "$TEST_OUT" | jq -e '.results' >/dev/null 2>&1; then
+                TEST_JSON="$TEST_OUT"
+              else
+                ERROR_MSG=$(echo "$TEST_OUT" | head -c 500 | jq -Rs '.')
+                TEST_JSON="{\"status\":\"error\",\"error\":$ERROR_MSG,\"results\":[]}"
+              fi
+              # Merge test into build result
+              echo "$BUILD_JSON" | jq --argjson test "$TEST_JSON" '. + {test: $test}' >> "$RESULTS_FILE"
             else
-              # Wrap error message in expected format
-              ERROR_MSG=$(echo "$TEST_OUT" | head -c 500 | jq -Rs '.')
-              TEST_RESULT="{\"status\":\"error\",\"error\":$ERROR_MSG,\"results\":[]}"
+              echo "$BUILD_JSON" >> "$RESULTS_FILE"
             fi
-            
-            EXT_RESULT=$(echo "$RESULTS" | jq --arg ext "$EXT" '.extensions[] | select(.id == $ext)')
-            EXT_RESULT=$(echo "$EXT_RESULT" | jq --argjson test "$TEST_RESULT" '. + {test: $test}')
-            UPDATED=$(echo "$UPDATED" | jq --argjson ext "$EXT_RESULT" '.extensions += [$ext]')
           done
           
-          # Add failed builds back
-          for EXT in $(echo "$RESULTS" | jq -r '.extensions[] | select(.status != "success") | .id'); do
-            EXT_RESULT=$(echo "$RESULTS" | jq --arg ext "$EXT" '.extensions[] | select(.id == $ext)')
-            UPDATED=$(echo "$UPDATED" | jq --argjson ext "$EXT_RESULT" '.extensions += [$ext]')
-          done
-          
-          echo "$UPDATED" > "$RESULTS_FILE"
+          echo ']}' >> "$RESULTS_FILE"
       
       - name: Generate summary
         run: |
