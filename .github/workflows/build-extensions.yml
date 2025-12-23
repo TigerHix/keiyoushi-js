@@ -1,0 +1,447 @@
+name: Build Extensions
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild all extensions'
+        required: false
+        default: false
+        type: boolean
+      extensions:
+        description: 'Specific extensions (comma-separated, e.g., en/mangapill,ja/shonenjumpplus)'
+        required: false
+        default: ''
+        type: string
+      skip_tests:
+        description: 'Skip extension tests'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/build-extensions.yml'
+
+concurrency:
+  group: build-extensions
+  cancel-in-progress: true
+
+env:
+  TACHIYOMI_JS_REPO: https://github.com/nemu-pm/tachiyomi-js
+  EXTENSIONS_REPO: https://github.com/keiyoushi/extensions-source
+
+jobs:
+  # ============================================================================
+  # Check upstream for changes
+  # ============================================================================
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      keiyoushi_commit: ${{ steps.check.outputs.keiyoushi_commit }}
+    steps:
+      - name: Check for upstream changes
+        id: check
+        run: |
+          LAST="${{ vars.KEIYOUSHI_LAST_COMMIT }}"
+          CURRENT=$(git ls-remote ${{ env.EXTENSIONS_REPO }} HEAD | cut -f1)
+          
+          echo "Last: $LAST"
+          echo "Current: $CURRENT"
+          echo "keiyoushi_commit=$CURRENT" >> $GITHUB_OUTPUT
+          
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          elif [ -z "$LAST" ] || [ "$LAST" != "$CURRENT" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ============================================================================
+  # Detect changed extensions
+  # ============================================================================
+  detect:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      extensions: ${{ steps.detect.outputs.extensions }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+      matrix: ${{ steps.detect.outputs.matrix }}
+    
+    steps:
+      - name: Clone extensions source (shallow)
+        run: git clone --depth=50 ${{ env.EXTENSIONS_REPO }} extensions-source
+      
+      - name: Detect changed extensions
+        id: detect
+        run: |
+          cd extensions-source
+          LAST_COMMIT="${{ vars.KEIYOUSHI_LAST_COMMIT }}"
+          
+          if [ "${{ inputs.force_rebuild }}" == "true" ]; then
+            EXTENSIONS=$(find src -mindepth 2 -maxdepth 2 -type d | sed 's|src/||' | sort | tr '\n' ',' | sed 's/,$//')
+          elif [ -n "${{ inputs.extensions }}" ]; then
+            EXTENSIONS="${{ inputs.extensions }}"
+          elif [ -z "$LAST_COMMIT" ]; then
+            EXTENSIONS=$(find src -mindepth 2 -maxdepth 2 -type d | sed 's|src/||' | sort | tr '\n' ',' | sed 's/,$//')
+          elif ! git cat-file -e "$LAST_COMMIT" 2>/dev/null; then
+            # Commit not in shallow clone, fetch more
+            git fetch --depth=200 origin main
+            if ! git cat-file -e "$LAST_COMMIT" 2>/dev/null; then
+              EXTENSIONS=$(find src -mindepth 2 -maxdepth 2 -type d | sed 's|src/||' | sort | tr '\n' ',' | sed 's/,$//')
+            else
+              CHANGED_FILES=$(git diff --name-only "$LAST_COMMIT" HEAD -- src/ 2>/dev/null || echo "")
+              EXTENSIONS=$(echo "$CHANGED_FILES" | grep '^src/' | cut -d'/' -f2-3 | sort -u | tr '\n' ',' | sed 's/,$//')
+            fi
+          else
+            CHANGED_FILES=$(git diff --name-only "$LAST_COMMIT" HEAD -- src/ 2>/dev/null || echo "")
+            if [ -z "$CHANGED_FILES" ]; then
+              echo "has_changes=false" >> $GITHUB_OUTPUT
+              echo "extensions=" >> $GITHUB_OUTPUT
+              echo "matrix=[]" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            EXTENSIONS=$(echo "$CHANGED_FILES" | grep '^src/' | cut -d'/' -f2-3 | sort -u | tr '\n' ',' | sed 's/,$//')
+          fi
+          
+          echo "extensions=$EXTENSIONS" >> $GITHUB_OUTPUT
+          
+          COUNT=$(echo "$EXTENSIONS" | tr ',' '\n' | grep -c . || echo 0)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          elif [ "$COUNT" -le 10 ]; then
+            echo "matrix=[0]" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          elif [ "$COUNT" -le 50 ]; then
+            echo "matrix=[0,1]" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          elif [ "$COUNT" -le 200 ]; then
+            echo "matrix=[0,1,2,3]" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "matrix=[0,1,2,3,4,5,6,7]" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+  # ============================================================================
+  # Build extensions
+  # ============================================================================
+  build:
+    needs: detect
+    if: needs.detect.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJson(needs.detect.outputs.matrix) }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Clone tachiyomi-js
+        run: git clone --depth=1 ${{ env.TACHIYOMI_JS_REPO }} tachiyomi-js
+      
+      - name: Clone extensions source
+        run: git clone --depth=1 ${{ env.EXTENSIONS_REPO }} extensions-source
+      
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+      
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+      
+      - name: Install dependencies
+        run: |
+          bun install
+          cd tachiyomi-js/cli && bun install
+      
+      - name: Make gradlew executable
+        run: chmod +x tachiyomi-js/shim/gradlew tachiyomi-js/compiler/gradlew
+      
+      - name: Create config
+        run: |
+          cat > tachiyomi.config.json << EOF
+          {
+            "source": "${{ github.workspace }}/extensions-source",
+            "output": "${{ github.workspace }}/dist/extensions"
+          }
+          EOF
+      
+      - name: Build extensions (chunk ${{ matrix.chunk }})
+        run: |
+          EXTENSIONS="${{ needs.detect.outputs.extensions }}"
+          IFS=',' read -ra EXT_ARRAY <<< "$EXTENSIONS"
+          TOTAL=${#EXT_ARRAY[@]}
+          
+          MATRIX='${{ needs.detect.outputs.matrix }}'
+          NUM_CHUNKS=$(echo "$MATRIX" | jq 'length')
+          CHUNK_SIZE=$(( (TOTAL + NUM_CHUNKS - 1) / NUM_CHUNKS ))
+          START=$(( ${{ matrix.chunk }} * CHUNK_SIZE ))
+          END=$(( START + CHUNK_SIZE ))
+          
+          if [ $START -ge $TOTAL ]; then
+            echo "No extensions in this chunk"
+            echo '{"chunk": ${{ matrix.chunk }}, "extensions": []}' > chunk-results.json
+            exit 0
+          fi
+          
+          mkdir -p dist/extensions
+          RESULTS_FILE="chunk-results.json"
+          echo '{"chunk": ${{ matrix.chunk }}, "extensions": [' > "$RESULTS_FILE"
+          FIRST=true
+          
+          for i in $(seq $START $(( END - 1 ))); do
+            if [ $i -ge $TOTAL ]; then break; fi
+            EXT="${EXT_ARRAY[$i]}"
+            
+            echo "::group::Building $EXT"
+            BUILD_START=$(date +%s%3N)
+            BUILD_OUTPUT=$(mktemp)
+            BUILD_STATUS="success"
+            
+            if ./tachiyomi-js/compiler/gradlew -p tachiyomi-js/compiler devBuild \
+                -Pextension="$EXT" \
+                -PextensionsRoot="${{ github.workspace }}/extensions-source" \
+                -PoutputDir="${{ github.workspace }}/dist/extensions" \
+                --build-cache --parallel --configuration-cache > "$BUILD_OUTPUT" 2>&1; then
+              echo "✅ $EXT"
+            else
+              BUILD_STATUS="failed"
+              echo "❌ $EXT"
+              cat "$BUILD_OUTPUT"
+            fi
+            
+            BUILD_TIME=$(($(date +%s%3N) - BUILD_START))
+            echo "::endgroup::"
+            
+            [ "$FIRST" = true ] && FIRST=false || echo ',' >> "$RESULTS_FILE"
+            BUILD_ERROR=$([ "$BUILD_STATUS" = "failed" ] && cat "$BUILD_OUTPUT" | tail -100 | jq -Rs '.' || echo 'null')
+            
+            cat >> "$RESULTS_FILE" << EOF
+          {"id": "$EXT", "status": "$BUILD_STATUS", "buildTimeMs": $BUILD_TIME, "error": $BUILD_ERROR}
+          EOF
+            rm -f "$BUILD_OUTPUT"
+          done
+          
+          echo ']}' >> "$RESULTS_FILE"
+      
+      - name: Post-process manifests
+        env:
+          TACHIYOMI_OUTPUT: ${{ github.workspace }}/dist/extensions
+          EXTENSIONS_SOURCE: ${{ github.workspace }}/extensions-source
+        run: bun scripts/postprocess-manifests.ts --all
+      
+      - name: Run tests
+        if: ${{ inputs.skip_tests != true }}
+        continue-on-error: true
+        env:
+          TACHIYOMI_OUTPUT: ${{ github.workspace }}/dist/extensions
+        run: |
+          RESULTS=$(cat chunk-results.json)
+          UPDATED=$(echo "$RESULTS" | jq '.extensions = []')
+          
+          for EXT in $(echo "$RESULTS" | jq -r '.extensions[] | select(.status == "success") | .id'); do
+            EXT_ID=$(echo "$EXT" | tr '/' '-')
+            echo "Testing $EXT_ID..."
+            
+            TEST_OUT=$(timeout 60 ./tachiyomi-js/cli/bin.ts test all "$EXT_ID" --json 2>&1 || echo '{"status":"error"}')
+            
+            if echo "$TEST_OUT" | jq . >/dev/null 2>&1; then
+              TEST_RESULT="$TEST_OUT"
+            else
+              TEST_RESULT='{"status":"error","error":"invalid output"}'
+            fi
+            
+            EXT_RESULT=$(echo "$RESULTS" | jq --arg ext "$EXT" '.extensions[] | select(.id == $ext)')
+            EXT_RESULT=$(echo "$EXT_RESULT" | jq --argjson test "$TEST_RESULT" '. + {test: $test}')
+            UPDATED=$(echo "$UPDATED" | jq --argjson ext "$EXT_RESULT" '.extensions += [$ext]')
+          done
+          
+          # Add failed builds back
+          for EXT in $(echo "$RESULTS" | jq -r '.extensions[] | select(.status != "success") | .id'); do
+            EXT_RESULT=$(echo "$RESULTS" | jq --arg ext "$EXT" '.extensions[] | select(.id == $ext)')
+            UPDATED=$(echo "$UPDATED" | jq --argjson ext "$EXT_RESULT" '.extensions += [$ext]')
+          done
+          
+          echo "$UPDATED" > chunk-results.json
+      
+      - name: Generate summary
+        run: |
+          echo "## Build Results (Chunk ${{ matrix.chunk }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Extension | Build | Test |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|------|" >> $GITHUB_STEP_SUMMARY
+          
+          jq -r '.extensions[] | 
+            "| \(.id) | \(if .status == "success" then "✅" else "❌ build failed" end) | \(
+              if .status != "success" then "—"
+              elif .test.summary then
+                if .test.summary.failed == 0 then "✅ \(.test.summary.passed)/\(.test.summary.total)"
+                else "❌ \(.test.summary.passed)/\(.test.summary.total)"
+                end
+              elif .test.status == "error" then "⚠️ error"
+              else "⏭️ skipped"
+              end
+            ) |"' chunk-results.json >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          BUILT=$(jq '[.extensions[] | select(.status == "success")] | length' chunk-results.json)
+          FAILED=$(jq '[.extensions[] | select(.status == "failed")] | length' chunk-results.json)
+          echo "**Built:** $BUILT | **Failed:** $FAILED" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-results-${{ matrix.chunk }}
+          path: chunk-results.json
+          retention-days: 1
+      
+      - name: Upload extensions
+        uses: actions/upload-artifact@v4
+        with:
+          name: extensions-chunk-${{ matrix.chunk }}
+          path: dist/extensions/
+          retention-days: 1
+          if-no-files-found: ignore
+
+  # ============================================================================
+  # Generate registry and deploy
+  # ============================================================================
+  registry:
+    needs: [check-upstream, detect, build]
+    if: always() && needs.detect.result == 'success'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+      
+      - name: Download extensions
+        if: needs.build.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/extensions/
+          pattern: extensions-chunk-*
+          merge-multiple: true
+      
+      - name: Download results
+        if: needs.build.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          path: .cache/build-results/
+          pattern: chunk-results-*
+          merge-multiple: true
+      
+      - name: Restore extension cache
+        uses: actions/cache/restore@v4
+        with:
+          path: dist/extensions
+          key: extensions-v1
+          restore-keys: extensions-
+      
+      - name: Generate registry
+        run: |
+          mkdir -p dist
+          
+          echo '{"extensions":[' > dist/index.json
+          FIRST=true
+          for manifest in dist/extensions/*/manifest.json; do
+            [ -f "$manifest" ] || continue
+            [ "$FIRST" = true ] && FIRST=false || echo ',' >> dist/index.json
+            cat "$manifest" >> dist/index.json
+          done
+          echo ']}' >> dist/index.json
+          
+          jq -c . dist/index.json > dist/index.min.json
+      
+      - name: Generate build report
+        run: bun scripts/generate-build-report.ts || echo "Report skipped"
+      
+      - name: Create index page
+        run: |
+          COUNT=$(jq '.extensions | length' dist/index.json)
+          cat > dist/index.html << EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>Keiyoushi Extensions</title>
+            <meta charset="utf-8">
+            <style>
+              body { font-family: system-ui; max-width: 800px; margin: 2rem auto; padding: 1rem; }
+              a { color: #0066cc; }
+              code { background: #f4f4f4; padding: 0.2em 0.4em; border-radius: 3px; }
+              .stats { color: #666; }
+            </style>
+          </head>
+          <body>
+            <h1>Keiyoushi Extensions</h1>
+            <p class="stats">$COUNT extensions available</p>
+            <h2>Registry</h2>
+            <ul>
+              <li><a href="index.json">index.json</a></li>
+              <li><a href="build-report.html">Build Report</a></li>
+            </ul>
+            <h2>Usage</h2>
+            <pre><code>const registry = await fetch('https://YOUR_DOMAIN/index.json').then(r => r.json());
+          const ext = await fetch(\`https://YOUR_DOMAIN/extensions/\${id}/extension.js\`).then(r => r.text());</code></pre>
+            <p><a href="https://github.com/nemu-pm/tachiyomi-js">tachiyomi-js</a></p>
+          </body>
+          </html>
+          EOF
+      
+      - name: Save extension cache
+        uses: actions/cache/save@v4
+        with:
+          path: dist/extensions
+          key: extensions-v1-${{ github.run_id }}
+      
+      - name: Upload pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/
+      
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
+      
+      - name: Update commit tracker
+        uses: actions/github-script@v7
+        env:
+          KEIYOUSHI_COMMIT: ${{ needs.check-upstream.outputs.keiyoushi_commit }}
+        with:
+          script: |
+            const commit = process.env.KEIYOUSHI_COMMIT;
+            if (!commit) return;
+            try {
+              await github.rest.actions.createOrUpdateRepoVariable({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'KEIYOUSHI_LAST_COMMIT',
+                value: commit
+              });
+            } catch (e) {
+              console.log('Could not update variable:', e.message);
+            }
+
+    permissions:
+      contents: write
+      pages: write
+      id-token: write

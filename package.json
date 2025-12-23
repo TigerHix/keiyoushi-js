@@ -1,0 +1,13 @@
+{
+  "name": "keiyoushi-js",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CI/CD for building Keiyoushi extensions to JavaScript",
+  "scripts": {
+    "report": "bun scripts/generate-build-report.ts",
+    "postprocess": "bun scripts/postprocess-manifests.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
