@@ -20,6 +20,8 @@ on:
         required: false
         default: false
         type: boolean
+  repository_dispatch:
+    types: [tachiyomi-js-update]
   push:
     branches: [main]
     paths:
@@ -197,7 +199,7 @@ jobs:
           
           if [ $START -ge $TOTAL ]; then
             echo "No extensions in this chunk"
-            echo '{"chunk": ${{ matrix.chunk }}, "extensions": []}' > chunk-results.json
+            echo '{"chunk": ${{ matrix.chunk }}, "extensions": []}' > "chunk-${{ matrix.chunk }}-results.json"
             exit 0
           fi
           
@@ -258,10 +260,9 @@ jobs:
           UPDATED=$(echo "$RESULTS" | jq '.extensions = []')
           
           for EXT in $(echo "$RESULTS" | jq -r '.extensions[] | select(.status == "success") | .id'); do
-            EXT_ID=$(echo "$EXT" | tr '/' '-')
-            echo "Testing $EXT_ID..."
+            echo "Testing $EXT..."
             
-            TEST_OUT=$(timeout 60 ./tachiyomi-js/cli/bin.ts test all "$EXT_ID" --json 2>&1 || true)
+            TEST_OUT=$(timeout 60 ./tachiyomi-js/cli/bin.ts test all "$EXT" --json 2>&1 || true)
             
             if echo "$TEST_OUT" | jq -e '.results' >/dev/null 2>&1; then
               TEST_RESULT="$TEST_OUT"
@@ -374,7 +375,8 @@ jobs:
           
           echo '{"extensions":[' > dist/index.json
           FIRST=true
-          for manifest in dist/extensions/*/manifest.json; do
+          # Extensions are in lang/name/ structure (e.g., all/ahottie/, en/mangapill/)
+          for manifest in dist/extensions/*/*/manifest.json; do
             [ -f "$manifest" ] || continue
             [ "$FIRST" = true ] && FIRST=false || echo ',' >> dist/index.json
             cat "$manifest" >> dist/index.json
@@ -391,6 +393,7 @@ jobs:
         if: steps.check.outputs.has_extensions == 'true'
         run: |
           COUNT=$(jq '.extensions | length' dist/index.json)
+          echo "Extensions in registry: $COUNT"
           cat > dist/index.html << EOF
           <!DOCTYPE html>
           <html>

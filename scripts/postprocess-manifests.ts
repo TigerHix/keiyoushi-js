@@ -157,7 +157,7 @@ function getAuthors(extensionPath: string): AuthorOutput[] {
     .sort((a, b) => a.firstCommit.localeCompare(b.firstCommit));
 }
 
-function processManifest(extDir: string): boolean {
+function processManifest(extDir: string, extensionPath: string): boolean {
   const manifestPath = path.join(extDir, "manifest.json");
   if (!fs.existsSync(manifestPath)) {
     console.error(`Manifest not found: ${manifestPath}`);
@@ -165,11 +165,6 @@ function processManifest(extDir: string): boolean {
   }
   
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
-  
-  // Extract lang/name from directory name (e.g., "en-mangapill" -> "en/mangapill")
-  const dirName = path.basename(extDir);
-  const [lang, ...nameParts] = dirName.split("-");
-  const extensionPath = `${lang}/${nameParts.join("-")}`;
   
   const authors = getAuthors(extensionPath);
   manifest.authors = authors;
@@ -194,30 +189,40 @@ function main() {
       process.exit(1);
     }
     
-    const dirs = fs.readdirSync(EXTENSIONS_DIR, { withFileTypes: true })
-      .filter(d => d.isDirectory())
-      .map(d => d.name);
+    // Extensions are in lang/name/ structure (e.g., all/ahottie/, en/mangapill/)
+    const extensions: Array<{ dir: string; path: string }> = [];
+    for (const lang of fs.readdirSync(EXTENSIONS_DIR, { withFileTypes: true })) {
+      if (!lang.isDirectory()) continue;
+      const langDir = path.join(EXTENSIONS_DIR, lang.name);
+      for (const name of fs.readdirSync(langDir, { withFileTypes: true })) {
+        if (!name.isDirectory()) continue;
+        extensions.push({
+          dir: path.join(langDir, name.name),
+          path: `${lang.name}/${name.name}`,
+        });
+      }
+    }
     
-    console.log(`Post-processing ${dirs.length} manifests...\n`);
+    console.log(`Post-processing ${extensions.length} manifests...\n`);
     let success = 0;
     
-    for (const dir of dirs) {
-      if (processManifest(path.join(EXTENSIONS_DIR, dir))) {
+    for (const ext of extensions) {
+      if (processManifest(ext.dir, ext.path)) {
         success++;
       }
     }
     
-    console.log(`\nDone: ${success}/${dirs.length}`);
+    console.log(`\nDone: ${success}/${extensions.length}`);
   } else {
-    const [lang, name] = args[0].split("/");
-    const extDir = path.join(EXTENSIONS_DIR, `${lang}-${name}`);
+    const extensionPath = args[0]; // e.g., "en/mangapill"
+    const extDir = path.join(EXTENSIONS_DIR, extensionPath);
     
     if (!fs.existsSync(extDir)) {
       console.error(`Extension not found: ${extDir}`);
       process.exit(1);
     }
     
-    processManifest(extDir);
+    processManifest(extDir, extensionPath);
   }
 }
 
