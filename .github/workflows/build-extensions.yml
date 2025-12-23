@@ -202,7 +202,7 @@ jobs:
           fi
           
           mkdir -p dist/extensions
-          RESULTS_FILE="chunk-results.json"
+          RESULTS_FILE="chunk-${{ matrix.chunk }}-results.json"
           echo '{"chunk": ${{ matrix.chunk }}, "extensions": [' > "$RESULTS_FILE"
           FIRST=true
           
@@ -253,19 +253,22 @@ jobs:
         env:
           TACHIYOMI_OUTPUT: ${{ github.workspace }}/dist/extensions
         run: |
-          RESULTS=$(cat chunk-results.json)
+          RESULTS_FILE="chunk-${{ matrix.chunk }}-results.json"
+          RESULTS=$(cat "$RESULTS_FILE")
           UPDATED=$(echo "$RESULTS" | jq '.extensions = []')
           
           for EXT in $(echo "$RESULTS" | jq -r '.extensions[] | select(.status == "success") | .id'); do
             EXT_ID=$(echo "$EXT" | tr '/' '-')
             echo "Testing $EXT_ID..."
             
-            TEST_OUT=$(timeout 60 ./tachiyomi-js/cli/bin.ts test all "$EXT_ID" --json 2>&1 || echo '{"status":"error"}')
+            TEST_OUT=$(timeout 60 ./tachiyomi-js/cli/bin.ts test all "$EXT_ID" --json 2>&1 || true)
             
-            if echo "$TEST_OUT" | jq . >/dev/null 2>&1; then
+            if echo "$TEST_OUT" | jq -e '.results' >/dev/null 2>&1; then
               TEST_RESULT="$TEST_OUT"
             else
-              TEST_RESULT='{"status":"error","error":"invalid output"}'
+              # Wrap error message in expected format
+              ERROR_MSG=$(echo "$TEST_OUT" | head -c 500 | jq -Rs '.')
+              TEST_RESULT="{\"status\":\"error\",\"error\":$ERROR_MSG,\"results\":[]}"
             fi
             
             EXT_RESULT=$(echo "$RESULTS" | jq --arg ext "$EXT" '.extensions[] | select(.id == $ext)')
@@ -279,10 +282,11 @@ jobs:
             UPDATED=$(echo "$UPDATED" | jq --argjson ext "$EXT_RESULT" '.extensions += [$ext]')
           done
           
-          echo "$UPDATED" > chunk-results.json
+          echo "$UPDATED" > "$RESULTS_FILE"
       
       - name: Generate summary
         run: |
+          RESULTS_FILE="chunk-${{ matrix.chunk }}-results.json"
           echo "## Build Results (Chunk ${{ matrix.chunk }})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Extension | Build | pop | lat | srch | det | chap | page | img |" >> $GITHUB_STEP_SUMMARY
@@ -291,18 +295,18 @@ jobs:
           jq -r '.extensions[] | 
             def test_icon(name): if .test.results then [.test.results[] | select(.test == name)] | if length == 0 then "—" elif .[0].passed then "✅" else "❌" end else "—" end;
             "| \(.id) | \(if .status == "success" then "✅" else "❌" end) | \(test_icon("popular")) | \(test_icon("latest")) | \(test_icon("search")) | \(test_icon("details")) | \(test_icon("chapters")) | \(test_icon("pages")) | \(test_icon("images")) |"
-          ' chunk-results.json >> $GITHUB_STEP_SUMMARY
+          ' "$RESULTS_FILE" >> $GITHUB_STEP_SUMMARY
           
           echo "" >> $GITHUB_STEP_SUMMARY
-          BUILT=$(jq '[.extensions[] | select(.status == "success")] | length' chunk-results.json)
-          FAILED=$(jq '[.extensions[] | select(.status == "failed")] | length' chunk-results.json)
+          BUILT=$(jq '[.extensions[] | select(.status == "success")] | length' "$RESULTS_FILE")
+          FAILED=$(jq '[.extensions[] | select(.status == "failed")] | length' "$RESULTS_FILE")
           echo "**Built:** $BUILT | **Failed:** $FAILED" >> $GITHUB_STEP_SUMMARY
       
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
           name: chunk-results-${{ matrix.chunk }}
-          path: chunk-results.json
+          path: chunk-${{ matrix.chunk }}-results.json
           retention-days: 1
       
       - name: Upload extensions
@@ -337,7 +341,7 @@ jobs:
           restore-keys: extensions-
       
       - name: Download extensions
-        if: needs.build.result == 'success'
+        if: needs.build.result != 'skipped'
         uses: actions/download-artifact@v4
         with:
           path: dist/extensions/
@@ -345,7 +349,7 @@ jobs:
           merge-multiple: true
       
       - name: Download results
-        if: needs.build.result == 'success'
+        if: needs.build.result != 'skipped'
         uses: actions/download-artifact@v4
         with:
           path: .cache/build-results/
