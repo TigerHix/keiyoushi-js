@@ -285,20 +285,13 @@ jobs:
         run: |
           echo "## Build Results (Chunk ${{ matrix.chunk }})" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Extension | Build | Test |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|-------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Extension | Build | pop | lat | srch | det | chap | page | img |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|-----|-----|------|-----|------|------|-----|" >> $GITHUB_STEP_SUMMARY
           
           jq -r '.extensions[] | 
-            "| \(.id) | \(if .status == "success" then "✅" else "❌ build failed" end) | \(
-              if .status != "success" then "—"
-              elif .test.summary then
-                if .test.summary.failed == 0 then "✅ \(.test.summary.passed)/\(.test.summary.total)"
-                else "❌ \(.test.summary.passed)/\(.test.summary.total)"
-                end
-              elif .test.status == "error" then "⚠️ error"
-              else "⏭️ skipped"
-              end
-            ) |"' chunk-results.json >> $GITHUB_STEP_SUMMARY
+            def test_icon(name): if .test.results then [.test.results[] | select(.test == name)] | if length == 0 then "—" elif .[0].passed then "✅" else "❌" end else "—" end;
+            "| \(.id) | \(if .status == "success" then "✅" else "❌" end) | \(test_icon("popular")) | \(test_icon("latest")) | \(test_icon("search")) | \(test_icon("details")) | \(test_icon("chapters")) | \(test_icon("pages")) | \(test_icon("images")) |"
+          ' chunk-results.json >> $GITHUB_STEP_SUMMARY
           
           echo "" >> $GITHUB_STEP_SUMMARY
           BUILT=$(jq '[.extensions[] | select(.status == "success")] | length' chunk-results.json)
@@ -325,7 +318,7 @@ jobs:
   # ============================================================================
   registry:
     needs: [check-upstream, detect, build]
-    if: always() && needs.detect.result == 'success'
+    if: always() && needs.detect.result == 'success' && needs.detect.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     
     steps:
@@ -334,6 +327,14 @@ jobs:
       
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
+      
+      - name: Restore extension cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: dist/extensions
+          key: extensions-v1
+          restore-keys: extensions-
       
       - name: Download extensions
         if: needs.build.result == 'success'
@@ -351,14 +352,19 @@ jobs:
           pattern: chunk-results-*
           merge-multiple: true
       
-      - name: Restore extension cache
-        uses: actions/cache/restore@v4
-        with:
-          path: dist/extensions
-          key: extensions-v1
-          restore-keys: extensions-
+      - name: Check for extensions
+        id: check
+        run: |
+          if [ -d "dist/extensions" ] && [ -n "$(ls -A dist/extensions 2>/dev/null)" ]; then
+            echo "has_extensions=true" >> $GITHUB_OUTPUT
+            echo "Found extensions to deploy"
+          else
+            echo "has_extensions=false" >> $GITHUB_OUTPUT
+            echo "No extensions found - skipping deploy"
+          fi
       
       - name: Generate registry
+        if: steps.check.outputs.has_extensions == 'true'
         run: |
           mkdir -p dist
           
@@ -374,9 +380,11 @@ jobs:
           jq -c . dist/index.json > dist/index.min.json
       
       - name: Generate build report
+        if: steps.check.outputs.has_extensions == 'true'
         run: bun scripts/generate-build-report.ts || echo "Report skipped"
       
       - name: Create index page
+        if: steps.check.outputs.has_extensions == 'true'
         run: |
           COUNT=$(jq '.extensions | length' dist/index.json)
           cat > dist/index.html << EOF
@@ -409,20 +417,24 @@ jobs:
           EOF
       
       - name: Save extension cache
+        if: steps.check.outputs.has_extensions == 'true'
         uses: actions/cache/save@v4
         with:
           path: dist/extensions
           key: extensions-v1-${{ github.run_id }}
       
       - name: Upload pages artifact
+        if: steps.check.outputs.has_extensions == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: dist/
       
       - name: Deploy to GitHub Pages
+        if: steps.check.outputs.has_extensions == 'true'
         uses: actions/deploy-pages@v4
       
       - name: Update commit tracker
+        if: steps.check.outputs.has_extensions == 'true'
         uses: actions/github-script@v7
         env:
           KEIYOUSHI_COMMIT: ${{ needs.check-upstream.outputs.keiyoushi_commit }}

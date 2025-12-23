@@ -1,29 +1,30 @@
 #!/usr/bin/env bun
 /**
  * Generate build report from chunk results
- * 
+ *
  * Usage: bun scripts/generate-build-report.ts
- * 
+ *
  * Reads: .cache/build-results/*.json
  * Writes: dist/build-report.json, dist/build-report.html
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
+import * as fs from "fs";
+import * as path from "path";
+
+interface TestResult {
+  test: string;
+  passed: boolean;
+  error?: string;
+  data?: unknown;
+}
 
 interface ExtensionResult {
   id: string;
-  status: 'success' | 'failed' | 'skipped';
+  status: "success" | "failed" | "skipped";
   buildTimeMs?: number;
   test?: {
-    status: 'pass' | 'fail' | 'error' | 'skipped';
-    durationMs?: number;
-    error?: string;
-    details?: {
-      sourcesLoaded?: number;
-      popularMangaCount?: number;
-      latestMangaCount?: number;
-    };
+    summary?: { passed?: number; failed?: number; total?: number };
+    results?: TestResult[];
   };
   error?: string;
 }
@@ -50,18 +51,20 @@ interface BuildReport {
   extensions: ExtensionResult[];
 }
 
-const ROOT_DIR = path.join(import.meta.dirname, '..');
-const cacheDir = path.join(ROOT_DIR, '.cache/build-results');
-const distDir = path.join(ROOT_DIR, 'dist');
+const TEST_TYPES = ["popular", "latest", "search", "details", "chapters", "pages", "images"] as const;
+
+const ROOT_DIR = path.join(import.meta.dirname, "..");
+const cacheDir = path.join(ROOT_DIR, ".cache/build-results");
+const distDir = path.join(ROOT_DIR, "dist");
 
 const allExtensions: ExtensionResult[] = [];
 const startTime = process.env.BUILD_START_TIME ? new Date(process.env.BUILD_START_TIME) : new Date();
 
 if (fs.existsSync(cacheDir)) {
-  const files = fs.readdirSync(cacheDir).filter(f => f.endsWith('.json'));
+  const files = fs.readdirSync(cacheDir).filter((f) => f.endsWith(".json"));
   for (const file of files) {
     try {
-      const content = fs.readFileSync(path.join(cacheDir, file), 'utf-8');
+      const content = fs.readFileSync(path.join(cacheDir, file), "utf-8");
       const chunk: ChunkResult = JSON.parse(content);
       allExtensions.push(...chunk.extensions);
     } catch (e) {
@@ -74,12 +77,12 @@ allExtensions.sort((a, b) => a.id.localeCompare(b.id));
 
 const summary = {
   total: allExtensions.length,
-  built: allExtensions.filter(e => e.status === 'success').length,
-  failed: allExtensions.filter(e => e.status === 'failed').length,
-  skipped: allExtensions.filter(e => e.status === 'skipped').length,
-  tested: allExtensions.filter(e => e.test).length,
-  passed: allExtensions.filter(e => e.test?.status === 'pass').length,
-  testFailed: allExtensions.filter(e => e.test && e.test.status !== 'pass' && e.test.status !== 'skipped').length,
+  built: allExtensions.filter((e) => e.status === "success").length,
+  failed: allExtensions.filter((e) => e.status === "failed").length,
+  skipped: allExtensions.filter((e) => e.status === "skipped").length,
+  tested: allExtensions.filter((e) => e.test?.results).length,
+  passed: allExtensions.filter((e) => e.test?.summary?.failed === 0).length,
+  testFailed: allExtensions.filter((e) => e.test?.summary && e.test.summary.failed! > 0).length,
 };
 
 const endTime = new Date();
@@ -88,8 +91,8 @@ const durationStr = `${Math.floor(durationMs / 60000)}m ${Math.floor((durationMs
 
 const report: BuildReport = {
   timestamp: endTime.toISOString(),
-  commit: process.env.GITHUB_SHA || 'local',
-  runId: process.env.GITHUB_RUN_ID || 'local',
+  commit: process.env.GITHUB_SHA || "local",
+  runId: process.env.GITHUB_RUN_ID || "local",
   duration: durationStr,
   summary,
   extensions: allExtensions,
@@ -97,13 +100,10 @@ const report: BuildReport = {
 
 fs.mkdirSync(distDir, { recursive: true });
 
-fs.writeFileSync(
-  path.join(distDir, 'build-report.json'),
-  JSON.stringify(report, null, 2)
-);
+fs.writeFileSync(path.join(distDir, "build-report.json"), JSON.stringify(report, null, 2));
 
 const html = generateHtmlReport(report);
-fs.writeFileSync(path.join(distDir, 'build-report.html'), html);
+fs.writeFileSync(path.join(distDir, "build-report.html"), html);
 
 console.log(`Build report generated:`);
 console.log(`  Total: ${summary.total}`);
@@ -112,51 +112,71 @@ console.log(`  Failed: ${summary.failed} ✗`);
 console.log(`  Skipped: ${summary.skipped}`);
 console.log(`  Tested: ${summary.tested} (${summary.passed} passed, ${summary.testFailed} failed)`);
 
-function generateHtmlReport(report: BuildReport): string {
-  const statusEmoji = (status: string) => {
-    switch (status) {
-      case 'success': case 'pass': return '✅';
-      case 'failed': case 'fail': return '❌';
-      case 'error': return '⚠️';
-      case 'skipped': return '⏭️';
-      default: return '❓';
-    }
-  };
+function getTestResult(ext: ExtensionResult, testName: string): "pass" | "fail" | "skip" {
+  const result = ext.test?.results?.find((r) => r.test === testName);
+  if (!result) return "skip";
+  return result.passed ? "pass" : "fail";
+}
 
+function generateHtmlReport(report: BuildReport): string {
   const statusClass = (status: string) => {
     switch (status) {
-      case 'success': case 'pass': return 'success';
-      case 'failed': case 'fail': return 'failed';
-      case 'error': return 'error';
-      case 'skipped': return 'skipped';
-      default: return '';
+      case "success":
+      case "pass":
+        return "success";
+      case "failed":
+      case "fail":
+        return "failed";
+      case "error":
+        return "error";
+      default:
+        return "skipped";
     }
   };
 
-  const extensionRows = report.extensions.map(ext => {
-    const testCell = ext.test 
-      ? `<span class="${statusClass(ext.test.status)}">${statusEmoji(ext.test.status)}</span>` 
-      : '<span class="skipped">-</span>';
-    
-    const errorSection = ext.error 
-      ? `<details class="error-details"><summary>Error</summary><pre>${escapeHtml(ext.error)}</pre></details>`
-      : '';
-    
-    const testErrorSection = ext.test?.error
-      ? `<details class="error-details"><summary>Test Error</summary><pre>${escapeHtml(ext.test.error)}</pre></details>`
-      : '';
+  const testIcon = (status: "pass" | "fail" | "skip") => {
+    switch (status) {
+      case "pass":
+        return '<span class="success">✅</span>';
+      case "fail":
+        return '<span class="failed">❌</span>';
+      default:
+        return '<span class="skipped">—</span>';
+    }
+  };
 
-    return `
+  const extensionRows = report.extensions
+    .map((ext) => {
+      const buildIcon = ext.status === "success" ? "✅" : ext.status === "failed" ? "❌" : "⏭️";
+      const testCells =
+        ext.status === "success"
+          ? TEST_TYPES.map((t) => `<td>${testIcon(getTestResult(ext, t))}</td>`).join("")
+          : TEST_TYPES.map(() => `<td><span class="skipped">—</span></td>`).join("");
+
+      const failedTests = ext.test?.results?.filter((r) => !r.passed) ?? [];
+      const buildError = ext.error
+        ? `<details class="error-details"><summary>Build error</summary><pre>${escapeHtml(ext.error)}</pre></details>`
+        : "";
+      const testErrors =
+        failedTests.length > 0
+          ? `<details class="error-details"><summary>${failedTests.length} test failed</summary><pre>${failedTests
+              .map((t) => `${t.test}: ${escapeHtml(t.error || "unknown error")}`)
+              .join("\n")}</pre></details>`
+          : "";
+
+      return `
       <tr class="${statusClass(ext.status)}">
         <td><code>${ext.id}</code></td>
-        <td><span class="${statusClass(ext.status)}">${statusEmoji(ext.status)} ${ext.status}</span></td>
-        <td>${ext.buildTimeMs ? `${(ext.buildTimeMs / 1000).toFixed(1)}s` : '-'}</td>
-        <td>${testCell}</td>
-        <td>${ext.test?.durationMs ? `${(ext.test.durationMs / 1000).toFixed(1)}s` : '-'}</td>
-        <td>${errorSection}${testErrorSection}</td>
+        <td><span class="${statusClass(ext.status)}">${buildIcon}</span></td>
+        ${testCells}
+        <td>${ext.buildTimeMs ? `${(ext.buildTimeMs / 1000).toFixed(1)}s` : "-"}</td>
+        <td>${buildError}${testErrors}</td>
       </tr>
     `;
-  }).join('');
+    })
+    .join("");
+
+  const testHeaders = TEST_TYPES.map((t) => `<th title="${t}">${t.slice(0, 3)}</th>`).join("");
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -185,7 +205,7 @@ function generateHtmlReport(report: BuildReport): string {
       padding: 2rem;
       line-height: 1.5;
     }
-    .container { max-width: 1200px; margin: 0 auto; }
+    .container { max-width: 1400px; margin: 0 auto; }
     h1 { margin: 0 0 0.5rem; font-size: 1.75rem; }
     .meta { color: var(--text-muted); margin-bottom: 2rem; font-size: 0.9rem; }
     .meta code { background: var(--bg-secondary); padding: 0.2em 0.4em; border-radius: 4px; }
@@ -226,16 +246,18 @@ function generateHtmlReport(report: BuildReport): string {
     .filter-btn:hover { border-color: var(--text-muted); }
     .filter-btn.active { border-color: var(--success); background: rgba(63, 185, 80, 0.1); }
     
+    .table-wrapper { overflow-x: auto; }
     table {
       width: 100%;
       border-collapse: collapse;
       background: var(--bg-secondary);
       border-radius: 8px;
       overflow: hidden;
+      font-size: 0.9rem;
     }
     th, td {
-      padding: 0.75rem 1rem;
-      text-align: left;
+      padding: 0.5rem 0.75rem;
+      text-align: center;
       border-bottom: 1px solid var(--border);
     }
     th { 
@@ -243,7 +265,10 @@ function generateHtmlReport(report: BuildReport): string {
       font-weight: 600;
       position: sticky;
       top: 0;
+      font-size: 0.8rem;
+      text-transform: capitalize;
     }
+    td:first-child, th:first-child { text-align: left; }
     tr:last-child td { border-bottom: none; }
     tr:hover { background: rgba(255,255,255,0.02); }
     
@@ -252,23 +277,24 @@ function generateHtmlReport(report: BuildReport): string {
     .error { color: var(--warning); }
     .skipped { color: var(--skipped); }
     
-    code { font-family: 'SF Mono', Consolas, monospace; font-size: 0.9em; }
+    code { font-family: 'SF Mono', Consolas, monospace; font-size: 0.85em; }
     
-    .error-details { margin-top: 0.5rem; }
+    .error-details { margin-top: 0.25rem; }
     .error-details summary {
       cursor: pointer;
       color: var(--failed);
-      font-size: 0.85rem;
+      font-size: 0.75rem;
     }
     .error-details pre {
       background: var(--bg);
-      padding: 1rem;
+      padding: 0.75rem;
       border-radius: 6px;
       overflow-x: auto;
-      font-size: 0.8rem;
-      margin: 0.5rem 0 0;
-      max-height: 300px;
+      font-size: 0.75rem;
+      margin: 0.25rem 0 0;
+      max-height: 200px;
       overflow-y: auto;
+      text-align: left;
     }
     
     .hidden { display: none; }
@@ -295,11 +321,7 @@ function generateHtmlReport(report: BuildReport): string {
       </div>
       <div class="stat failed">
         <div class="stat-value">${report.summary.failed}</div>
-        <div class="stat-label">Failed</div>
-      </div>
-      <div class="stat">
-        <div class="stat-value">${report.summary.skipped}</div>
-        <div class="stat-label">Skipped</div>
+        <div class="stat-label">Build Failed</div>
       </div>
       <div class="stat success">
         <div class="stat-value">${report.summary.passed}</div>
@@ -314,25 +336,25 @@ function generateHtmlReport(report: BuildReport): string {
     <div class="filters">
       <button class="filter-btn active" data-filter="all">All (${report.summary.total})</button>
       <button class="filter-btn" data-filter="success">Built (${report.summary.built})</button>
-      <button class="filter-btn" data-filter="failed">Failed (${report.summary.failed})</button>
-      <button class="filter-btn" data-filter="test-failed">Test Failed (${report.summary.testFailed})</button>
+      <button class="filter-btn" data-filter="failed">Build Failed (${report.summary.failed})</button>
     </div>
     
-    <table>
-      <thead>
-        <tr>
-          <th>Extension</th>
-          <th>Build</th>
-          <th>Build Time</th>
-          <th>Test</th>
-          <th>Test Time</th>
-          <th>Details</th>
-        </tr>
-      </thead>
-      <tbody id="extensions">
-        ${extensionRows}
-      </tbody>
-    </table>
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Extension</th>
+            <th>Build</th>
+            ${testHeaders}
+            <th>Time</th>
+            <th>Errors</th>
+          </tr>
+        </thead>
+        <tbody id="extensions">
+          ${extensionRows}
+        </tbody>
+      </table>
+    </div>
   </div>
   
   <script>
@@ -345,9 +367,6 @@ function generateHtmlReport(report: BuildReport): string {
         document.querySelectorAll('#extensions tr').forEach(row => {
           if (filter === 'all') {
             row.classList.remove('hidden');
-          } else if (filter === 'test-failed') {
-            const hasTestError = row.querySelector('.error-details summary')?.textContent.includes('Test');
-            row.classList.toggle('hidden', !hasTestError);
           } else {
             row.classList.toggle('hidden', !row.classList.contains(filter));
           }
@@ -361,9 +380,9 @@ function generateHtmlReport(report: BuildReport): string {
 
 function escapeHtml(str: string): string {
   return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
